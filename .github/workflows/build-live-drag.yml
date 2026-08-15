@@ -42,8 +42,30 @@ jobs:
             --collect-all pymobiledevice3 `
             --collect-all pycountry `
             --collect-all flask `
+            --recursive-copy-metadata pymobiledevice3 `
+            --copy-metadata pyimg4 `
             --hidden-import pyi_splash `
             src/main.py
+
+      - name: Smoke-test executable startup
+        shell: pwsh
+        run: |
+          $stdout = Join-Path $env:RUNNER_TEMP "geoport-stdout.txt"
+          $stderr = Join-Path $env:RUNNER_TEMP "geoport-stderr.txt"
+          $process = Start-Process -FilePath ".\\dist\\GeoPort-Windows-v4.0.2-LiveDrag.exe" `
+            -ArgumentList "--no-browser", "--port", "54322" `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr `
+            -PassThru
+          Start-Sleep -Seconds 15
+          if ($process.HasExited) {
+            Write-Host "GeoPort exited during startup."
+            if (Test-Path $stdout) { Get-Content $stdout }
+            if (Test-Path $stderr) { Get-Content $stderr }
+            throw "GeoPort startup smoke test failed."
+          }
+          Stop-Process -Id $process.Id -Force
+          Write-Host "GeoPort remained running for 15 seconds."
 
       - name: Upload executable
         uses: actions/upload-artifact@v4

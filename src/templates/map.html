@@ -1371,6 +1371,7 @@ function sendGPXToBackend() {
 // Function to create a marker with all necessary event listeners
 function createMarker(latlng) {
     marker = L.marker(latlng, { draggable: true }).addTo(map);
+    marker.on('drag', handleMarkerDrag);
     marker.on('dragend', handleMarkerDragEnd);
     marker.on('contextmenu', handleMarkerRightClick); // Add event listener for marker right-click
     return marker;
@@ -1390,6 +1391,12 @@ function handleMapDoubleClick(e) {
 
     // Add the right-click event listener to the active marker
     marker.on('contextmenu', handleActiveMarkerRightClick);
+}
+
+// Update coordinates continuously while the marker is being dragged.
+function handleMarkerDrag(event) {
+    const latLng = event.target.getLatLng();
+    setCoordinates(latLng.lat, latLng.lng);
 }
 
 // Function to handle marker drag end
@@ -1417,20 +1424,53 @@ let currentLayer = null;
 
 
 // Function to set coordinates
-function setCoordinates(lat, lng) {
-    document.getElementById('coordinates').value = lat + ', ' + lng;
-    updateSetLocationButtonStatus();
-    updateStopLocationButtonStatus(); // Add this line to update the Stop Location button status
+let pendingLiveCoordinates = null;
+let liveCoordinateRequestActive = false;
+let liveCoordinateTimer = null;
+
+function flushLiveCoordinates() {
+    if (liveCoordinateRequestActive || !pendingLiveCoordinates) {
+        return;
+    }
+
+    const coordinatesToSend = pendingLiveCoordinates;
+    pendingLiveCoordinates = null;
+    liveCoordinateRequestActive = true;
+
     fetch('/update_location', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ lat, lng }),
+        body: JSON.stringify(coordinatesToSend),
     })
-        .then(response => response.text())
-        .then(data => console.log(data))
-        .catch(error => console.error('Error updating location:', error));
+        .catch(error => console.error('Error updating live location:', error))
+        .finally(() => {
+            liveCoordinateRequestActive = false;
+
+            // Discard stale intermediate points and send only the latest one.
+            if (pendingLiveCoordinates) {
+                liveCoordinateTimer = setTimeout(() => {
+                    liveCoordinateTimer = null;
+                    flushLiveCoordinates();
+                }, 50);
+            }
+        });
+}
+
+function setCoordinates(lat, lng) {
+    document.getElementById('coordinates').value = lat + ', ' + lng;
+    updateSetLocationButtonStatus();
+    updateStopLocationButtonStatus();
+
+    pendingLiveCoordinates = { lat, lng };
+
+    if (!liveCoordinateRequestActive && liveCoordinateTimer === null) {
+        liveCoordinateTimer = setTimeout(() => {
+            liveCoordinateTimer = null;
+            flushLiveCoordinates();
+        }, 50);
+    }
 }
 
 // Function to handle search
@@ -1449,7 +1489,8 @@ async function searchLocation(input, userLocale) {
             const { x, y } = results[0];
             if (!marker) {
                 marker = L.marker([y, x], { draggable: true }).addTo(map);
-                marker.on('dragend', handleMarkerDragEnd); // Add event listener for marker drag
+                marker.on('drag', handleMarkerDrag);
+    marker.on('dragend', handleMarkerDragEnd); // Add event listener for marker drag
                 marker.on('contextmenu', handleMarkerRightClick); // Add event listener for marker right-click
 
             } else {

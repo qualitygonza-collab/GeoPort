@@ -109,6 +109,8 @@ APP_VERSION_NUMBER = "2.3.3"
 APP_VERSION_TYPE = "fuel"
 terminate_tunnel_thread = False
 terminate_location_thread = False
+location_thread = None
+location_thread_lock = threading.Lock()
 location_threads = []
 timeout = DEFAULT_BONJOUR_TIMEOUT
 
@@ -965,91 +967,90 @@ def mount_developer_image():
         error_message = str(e)
         return jsonify({'error': error_message})
 
-async def set_location_thread(latitude, longitude):
+async def set_location_thread(latitude=None, longitude=None):
+    """Keep one DVT connection open and stream only changed coordinates."""
     global terminate_location_thread
+    global rsd_host, rsd_port, udid, ios_version, connection_type
+    global location
+
+    def stream_locations(simulator):
+        last_location = None
+
+        while not terminate_location_thread:
+            current_location = location
+
+            if current_location and current_location != last_location:
+                current_latitude, current_longitude = current_location.split()
+                simulator.set(float(current_latitude), float(current_longitude))
+                last_location = current_location
+                logger.debug(f"Live location updated: {current_location}")
+
+            # 20 Hz polling keeps dragging responsive without reopening DVT.
+            time.sleep(0.05)
 
     try:
-        global rsd_host, rsd_port, udid, ios_version, connection_type
+        if udid in rsd_data_map and connection_type in rsd_data_map[udid]:
+            rsd_data = rsd_data_map[udid][connection_type]
+            rsd_host = rsd_data['host']
+            rsd_port = rsd_data['port']
 
-        if udid in rsd_data_map:
-            if connection_type in rsd_data_map[udid]:
-                rsd_data = rsd_data_map[udid][connection_type]
-                rsd_host = rsd_data['host']
-                rsd_port = rsd_data['port']
+            logger.info(f"RSD in udid mapping is: {rsd_data}")
+            logger.info("Starting persistent live-location connection")
 
-                logger.info(f"RSD in udid mapping is: {rsd_data}")
-                logger.info("RSD already created. Reusing connection")
-                logger.info(f"RSD Data: {rsd_data}")
+            if ios_version is not None and is_major_version_17_or_greater(ios_version):
+                async with RemoteServiceDiscoveryService((rsd_host, rsd_port)) as sp_rsd:
+                    with DvtSecureSocketProxyService(sp_rsd) as dvt:
+                        stream_locations(LocationSimulation(dvt))
 
-
-                if ios_version is not None and is_major_version_17_or_greater(ios_version):
-                    async with RemoteServiceDiscoveryService((rsd_host, rsd_port)) as sp_rsd:
-                        with DvtSecureSocketProxyService(sp_rsd) as dvt:
-                            LocationSimulation(dvt).set(latitude, longitude)
-                            logger.warning("Location Set Successfully")
-                            #OSUTILS.wait_return()
-                            while not terminate_location_thread:
-                                time.sleep(0.5)
-
-
-                elif ios_version is not None and not is_major_version_17_or_greater(ios_version):
-                    with DvtSecureSocketProxyService(lockdown=lockdown) as dvt:
-                        LocationSimulation(dvt).clear()
-                        LocationSimulation(dvt).set(latitude, longitude)
-                        logger.warning("Location Set Successfully")
-                        #await asyncio.wait_for(OSUTILS.wait_return(), timeout=1)  # Adjust timeout as needed
-                        while not terminate_location_thread:
-                            time.sleep(0.5)
-
-                await asyncio.sleep(1)  # Adjust sleep time according to your requirements
+            elif ios_version is not None and not is_major_version_17_or_greater(ios_version):
+                with DvtSecureSocketProxyService(lockdown=lockdown) as dvt:
+                    simulator = LocationSimulation(dvt)
+                    simulator.clear()
+                    stream_locations(simulator)
 
     except asyncio.CancelledError:
-        # Handle cancellation gracefully
         pass
     except ConnectionResetError as cre:
-        if "[Errno 54] Connection reset by peer" in str(cre):
-            logger.error("The Set Location buffer is full. Try to 'Stop Location' to clear old connections")
+        logger.error(f"Live-location connection reset: {cre}")
     except Exception as e:
-        logger.error(f"Error setting location: {e}")
+        logger.error(f"Error setting live location: {e}")
 
 
-# Function to start the set_location_thread in a separate thread
-def start_set_location_thread(latitude, longitude):
-    global terminate_location_thread
-    # Stop existing threads
-    stop_set_location_thread()
+def start_set_location_thread(latitude=None, longitude=None):
+    """Start the persistent worker once; subsequent updates reuse it."""
+    global terminate_location_thread, location_thread
 
-    # Reset the terminate flag before starting the thread
-    terminate_location_thread = False
+    with location_thread_lock:
+        if location_thread is not None and location_thread.is_alive():
+            return False
 
+        terminate_location_thread = False
+        location_thread = threading.Thread(
+            target=lambda: asyncio.run(set_location_thread(latitude, longitude)),
+            name="GeoPortLiveLocation",
+            daemon=True,
+        )
+        location_thread.start()
 
-
-    # Define a helper function to run the async function in the thread
-    async def run_async_function():
-        await set_location_thread(latitude, longitude)
-
-    # Define a function to periodically check if the thread should terminate
-    def check_termination():
-        while not terminate_location_thread:
-            asyncio.run(asyncio.sleep(1))  # Adjust sleep time as needed
-        logger.info("Location Thread Terminated")
-
-    # Create a new thread and start it
-    location_thread = threading.Thread(target=lambda: asyncio.run(run_async_function()))
-    location_thread.start()
-
-    # Create a new thread for checking termination
-    termination_thread = threading.Thread(target=check_termination)
-    termination_thread.start()
+    return True
 
 
-# Function to stop the location thread
 def stop_set_location_thread():
-    # Set the flag to indicate that the thread should stop
-    global terminate_location_thread
+    global terminate_location_thread, location_thread
+
     terminate_location_thread = True
+    thread = location_thread
 
+    if (
+        thread is not None
+        and thread.is_alive()
+        and thread is not threading.current_thread()
+    ):
+        thread.join(timeout=2)
 
+    with location_thread_lock:
+        if location_thread is not None and not location_thread.is_alive():
+            location_thread = None
 
 
 @app.route('/set_location', methods=['POST'])
